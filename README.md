@@ -167,3 +167,5 @@ A free sibling starter, with copy-paste audit prompts and one read-only reposito
 ## License
 
 [MIT](LICENSE) © 2026 Digital Fortress. Authorized defensive use only, as described above.
+
+**Go deeper:** the [Agent Runtime Containment Pack ($99)](https://fortressaudit.gumroad.com/l/ngouvf) covers agent egress, identity, Kubernetes sandboxing, and tool-call authorization.
