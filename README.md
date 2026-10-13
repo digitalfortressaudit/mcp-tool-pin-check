@@ -2,8 +2,6 @@
 
 Pin an MCP server's tool definitions, then diff a later listing for silent changes. One read-only Python script. No third-party packages.
 
-**Want the review set this belongs to?** The [$79 MCP & Multi-Agent Authorization Security Pack](https://fortressaudit.gumroad.com/l/wphmlq) is the Digital Fortress pack for MCP tool trust.
-
 Use it on servers you own or are explicitly allowed to assess.
 
 ## Why it matters
@@ -155,6 +153,7 @@ Digital Fortress publishes paid review packs for teams that want more than a loc
 - **[$79 MCP & Multi-Agent Authorization Security Pack](https://fortressaudit.gumroad.com/l/wphmlq)** — the pack for MCP tool trust.
 - **[$99 AI Security & Infrastructure Prompt Pack](https://fortressaudit.gumroad.com/l/myyeen)**
 - **[$149 Multi-Agent Orchestration Blueprint](https://fortressaudit.gumroad.com/l/cvxfw)**
+- **[$99 Agent Runtime Containment Pack](https://fortressaudit.gumroad.com/l/ngouvf)**: agent egress, identity, Kubernetes sandboxing, and tool-call authorization.
 
 A free sibling starter, with copy-paste audit prompts and one read-only repository scan, is the [AI Security Starter Checklist](https://github.com/digitalfortressaudit/ai-security-starter-checklist).
 
@@ -167,5 +166,3 @@ A free sibling starter, with copy-paste audit prompts and one read-only reposito
 ## License
 
 [MIT](LICENSE) © 2026 Digital Fortress. Authorized defensive use only, as described above.
-
-**Go deeper:** the [Agent Runtime Containment Pack ($99)](https://fortressaudit.gumroad.com/l/ngouvf) covers agent egress, identity, Kubernetes sandboxing, and tool-call authorization.
