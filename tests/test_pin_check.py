@@ -274,6 +274,216 @@ class PinCheckTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("error:", err)
 
+    def test_output_enum_widened_is_flagged_on_its_own_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "tools.lock.json"
+            pin_code, _, pin_err = self._run(
+                [
+                    "pin",
+                    "--listing",
+                    str(EXAMPLES / "tools-list.output.json"),
+                    "--lock",
+                    str(lock),
+                    "--source",
+                    "local-notes",
+                    "--pinned-at",
+                    PINNED_AT,
+                ]
+            )
+            self.assertEqual((pin_code, pin_err), (0, ""))
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.output-enum-widened.json"), "--lock", str(lock)]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "")
+            widened = [line for line in out.splitlines() if "output widened" in line]
+            self.assertEqual(widened, [
+                '    output widened: properties.status.enum (added "deleted"); '
+                "a new output enum value can break downstream exhaustive switches"
+            ])
+            self.assertNotIn("[widened]", widened[0])
+            self.assertNotIn("schema widened", out)
+            self.assertNotIn("output changed", out)
+
+    def test_output_changes_are_separate_from_input_widening(self) -> None:
+        output_schema = {
+            "additionalProperties": False,
+            "properties": {
+                "status": {"enum": ["open", "archived"], "type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["status", "title"],
+            "type": "object",
+        }
+        removed_title = {
+            "additionalProperties": False,
+            "properties": {"status": {"enum": ["open", "archived"], "type": "string"}},
+            "required": ["status"],
+            "type": "object",
+        }
+        base_input = _schema()
+        widened_input = {
+            **base_input,
+            "properties": {**base_input["properties"], "limit": {"type": "integer"}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = self._write(
+                root,
+                "base.json",
+                {"tools": [{"description": "Look up a note.", "inputSchema": base_input, "name": "lookup_note", "outputSchema": output_schema}]},
+            )
+            current = self._write(
+                root,
+                "changed.json",
+                {"tools": [{"description": "Look up a note.", "inputSchema": widened_input, "name": "lookup_note", "outputSchema": removed_title}]},
+            )
+            lock = root / "tools.lock.json"
+            pin_code, _, pin_err = self._run(
+                ["pin", "--listing", str(original), "--lock", str(lock), "--pinned-at", PINNED_AT]
+            )
+            self.assertEqual((pin_code, pin_err), (0, ""))
+            code, out, err = self._run(["check", "--listing", str(current), "--lock", str(lock)])
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "")
+            lines = out.splitlines()
+            input_lines = [line for line in lines if "property added: properties.limit" in line]
+            output_lines = [line for line in lines if line.strip().startswith("output changed:")]
+            self.assertEqual(input_lines, ["    [widened] property added: properties.limit (optional)"])
+            self.assertIn("    output changed: property removed: properties.title", output_lines)
+            self.assertTrue(all("output widened" not in line and "output changed" not in line for line in input_lines))
+            self.assertTrue(all("[widened]" not in line and "schema widened" not in line for line in output_lines))
+            self.assertIn("    schema widened: yes", lines)
+            self.assertNotIn("output widened", out)
+
+    def test_v01_lock_without_output_schema_checks_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock = root / "v01.lock.json"
+            payload = json.loads((EXAMPLES / "tools-list.json").read_text(encoding="utf-8"))
+            tools = []
+            for tool in payload["result"]["tools"]:
+                definition = {
+                    "description": tool["description"],
+                    "inputSchema": tool["inputSchema"],
+                    "name": tool["name"],
+                    "annotations": tool["annotations"],
+                }
+                tools.append({"definition": definition, "name": tool["name"], "sha256": pin._digest(definition)})
+            tools.sort(key=lambda item: item["name"])
+            lock_doc = {"lockfile_version": 1, "pinned_at": PINNED_AT, "source": "local-notes", "tools": tools}
+            self.assertTrue(all("outputSchema" not in item["definition"] for item in tools))
+            lock.write_text(json.dumps(lock_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            code, out, err = self._run(["check", "--listing", str(EXAMPLES / "tools-list.json"), "--lock", str(lock)])
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertIn("result: unchanged", out)
+
+            listing = json.loads((EXAMPLES / "tools-list.json").read_text(encoding="utf-8"))
+            listing["result"]["tools"][0]["outputSchema"] = {
+                "properties": {"id": {"type": "string"}},
+                "type": "object",
+            }
+            added = self._write(root, "with-output.json", listing)
+            code, out, err = self._run(["check", "--listing", str(added), "--lock", str(lock)])
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "")
+            self.assertIn("    output changed: outputSchema added (not present in the pin)", out.splitlines())
+            self.assertNotIn("output widened", out)
+
+    def test_pin_is_deterministic_with_output_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.lock.json"
+            second = root / "b.lock.json"
+            argv = [
+                "pin",
+                "--listing",
+                str(EXAMPLES / "tools-list.output.json"),
+                "--source",
+                "local-notes",
+                "--pinned-at",
+                PINNED_AT,
+            ]
+            code_a, _, err_a = self._run([*argv, "--lock", str(first)])
+            code_b, _, err_b = self._run([*argv, "--lock", str(second)])
+            self.assertEqual((code_a, err_a), (0, ""))
+            self.assertEqual((code_b, err_b), (0, ""))
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+
+            locked = json.loads(first.read_text(encoding="utf-8"))
+            self.assertEqual([item["name"] for item in locked["tools"]], ["get_note", "list_notes"])
+            self.assertTrue(all(isinstance(item["definition"]["outputSchema"], dict) for item in locked["tools"]))
+            self.assertTrue(all(len(item["sha256"]) == 64 for item in locked["tools"]))
+            self.assertEqual(locked["tools"][0]["sha256"], pin._digest(locked["tools"][0]["definition"]))
+
+            original = json.loads((EXAMPLES / "tools-list.output.json").read_text(encoding="utf-8"))
+            reordered = {
+                "id": 9,
+                "jsonrpc": "2.0",
+                "result": {"tools": list(reversed(original["result"]["tools"]))},
+            }
+            other = self._write(root, "reordered.json", reordered)
+            third = root / "c.lock.json"
+            code_c, _, err_c = self._run(
+                ["pin", "--listing", str(other), "--lock", str(third), "--source", "local-notes", "--pinned-at", PINNED_AT]
+            )
+            self.assertEqual((code_c, err_c), (0, ""))
+            locked_c = json.loads(third.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["sha256"] for item in locked["tools"]],
+                [item["sha256"] for item in locked_c["tools"]],
+            )
+
+            omitted = self._write(
+                root,
+                "omitted.json",
+                {"tools": [{"description": "Look up a note.", "inputSchema": {"type": "object"}, "name": "lookup_note"}]},
+            )
+            explicit = self._write(
+                root,
+                "explicit-null.json",
+                {
+                    "tools": [
+                        {
+                            "description": "Look up a note.",
+                            "inputSchema": {"type": "object"},
+                            "name": "lookup_note",
+                            "outputSchema": None,
+                        }
+                    ]
+                },
+            )
+            omitted_lock = root / "omitted.lock.json"
+            explicit_lock = root / "explicit.lock.json"
+            self.assertEqual(
+                self._run(["pin", "--listing", str(omitted), "--lock", str(omitted_lock), "--pinned-at", PINNED_AT])[0],
+                0,
+            )
+            self.assertEqual(
+                self._run(["pin", "--listing", str(explicit), "--lock", str(explicit_lock), "--pinned-at", PINNED_AT])[0],
+                0,
+            )
+            omitted_doc = json.loads(omitted_lock.read_text(encoding="utf-8"))
+            explicit_doc = json.loads(explicit_lock.read_text(encoding="utf-8"))
+            self.assertIsNone(omitted_doc["tools"][0]["definition"]["outputSchema"])
+            self.assertEqual(
+                omitted_doc["tools"][0]["sha256"],
+                explicit_doc["tools"][0]["sha256"],
+            )
+            check_code, check_out, check_err = self._run(
+                ["check", "--listing", str(explicit), "--lock", str(omitted_lock)]
+            )
+            self.assertEqual((check_code, check_err), (0, ""))
+            self.assertIn("result: unchanged", check_out)
+
+            bad = self._write(root, "bad-output.json", {"tools": [{"name": "lookup_note", "outputSchema": ["nope"]}]})
+            code, _, err = self._run(["pin", "--listing", str(bad), "--lock", str(root / "bad.lock.json")])
+            self.assertEqual(code, 2)
+            self.assertIn("outputSchema", err)
+            self.assertFalse((root / "bad.lock.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

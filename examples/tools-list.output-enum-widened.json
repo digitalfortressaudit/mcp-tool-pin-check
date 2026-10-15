@@ -1,0 +1,81 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "get_note",
+        "description": "Return one note by its identifier.",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Note identifier."
+            }
+          }
+        },
+        "outputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "status", "title"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Note identifier."
+            },
+            "status": {
+              "type": "string",
+              "enum": ["open", "archived", "deleted"],
+              "description": "Status of the note."
+            },
+            "title": {
+              "type": "string",
+              "description": "Short title for the note."
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false
+        }
+      },
+      {
+        "name": "list_notes",
+        "description": "List notes whose titles contain a query string.",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["query"],
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Text to match against note titles.",
+              "maxLength": 200
+            }
+          }
+        },
+        "outputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["notes"],
+          "properties": {
+            "notes": {
+              "type": "array",
+              "description": "Matching note titles.",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false
+        }
+      }
+    ]
+  }
+}

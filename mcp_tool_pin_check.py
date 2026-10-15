@@ -9,6 +9,9 @@
 Reads a local JSON file only. Writes only the lockfile path passed to ``pin``.
 Does not connect to a server, call tools, or execute listing text. Use only
 on servers you own or are authorized to assess.
+
+Each pinned tool includes ``outputSchema`` (``null`` when the listing has
+none). The SHA-256 is the canonical JSON of that whole definition.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+__version__ = "0.2.0"
 
 EXIT_OK = 0
 EXIT_DRIFT = 1
@@ -97,7 +102,11 @@ def extract_tools(payload: Any) -> list[Any]:
 
 
 def normalize_tool(tool: Any) -> dict[str, Any]:
-    """Keep name, description, inputSchema, and annotations when present."""
+    """Keep name, description, both schemas, and annotations when present.
+
+    ``outputSchema`` is always recorded. A tool that omits it, or sets it to
+    null, stores ``null`` and still pins successfully.
+    """
     if not isinstance(tool, dict):
         raise InputError("each tool must be a JSON object")
     name = tool.get("name")
@@ -111,7 +120,15 @@ def normalize_tool(tool: Any) -> dict[str, Any]:
     schema = {} if tool.get("inputSchema") is None else tool.get("inputSchema", {})
     if not isinstance(schema, dict):
         raise InputError(f"tool {name!r} inputSchema must be a JSON object")
-    definition: dict[str, Any] = {"description": description, "inputSchema": schema, "name": name}
+    output = None if "outputSchema" not in tool else tool.get("outputSchema")
+    if output is not None and not isinstance(output, dict):
+        raise InputError(f"tool {name!r} outputSchema must be a JSON object")
+    definition: dict[str, Any] = {
+        "description": description,
+        "inputSchema": schema,
+        "name": name,
+        "outputSchema": output,
+    }
     if "annotations" in tool and tool["annotations"] is not None:
         annotations = tool["annotations"]
         if not isinstance(annotations, dict):
@@ -319,14 +336,45 @@ def description_diff(old: str, new: str) -> str:
     return "".join(diff).rstrip("\n")
 
 
+def _digest_against_pin(current: dict[str, Any], locked_definition: dict[str, Any]) -> str:
+    """Hash ``current`` the way this pin hashed the tool.
+
+    v0.1 lock entries have no ``outputSchema`` key. v0.2 records a missing
+    output schema as null. Those two shapes are the same tool, so a v0.1 pin
+    still matches a listing that does not define an output schema.
+    """
+    if "outputSchema" not in locked_definition and current.get("outputSchema") is None:
+        comparable = {key: value for key, value in current.items() if key != "outputSchema"}
+        return _digest(comparable)
+    return _digest(current)
+
+
+def _output_findings(old_def: dict[str, Any], new_def: dict[str, Any]) -> list[dict[str, Any]]:
+    """Diff output schemas. A missing v0.1 key and a null schema are the same."""
+    old_schema = old_def.get("outputSchema") if "outputSchema" in old_def else None
+    new_schema = new_def.get("outputSchema") if "outputSchema" in new_def else None
+    if old_schema is None and new_schema is None:
+        return []
+    if old_schema is None and isinstance(new_schema, dict):
+        return [_change("outputSchema", "output_added", "not present in the pin", False)]
+    if isinstance(old_schema, dict) and new_schema is None:
+        return [_change("outputSchema", "output_removed", "outputSchema removed", False)]
+    if isinstance(old_schema, dict) and isinstance(new_schema, dict):
+        return compare_schemas(old_schema, new_schema)
+    return [_change("outputSchema", "value_changed", "outputSchema replaced", False)]
+
+
 def diff_tool(old_def: dict[str, Any], new_def: dict[str, Any]) -> dict[str, Any]:
     schema_changes = compare_schemas(old_def.get("inputSchema", {}), new_def.get("inputSchema", {}))
+    output_changes = _output_findings(old_def, new_def)
     description_changed = old_def.get("description", "") != new_def.get("description", "")
     return {
         "annotations_changed": old_def.get("annotations") != new_def.get("annotations"),
         "description_changed": description_changed,
         "description_diff": description_diff(old_def.get("description", ""), new_def.get("description", "")) if description_changed else "",
         "name": new_def["name"],
+        "output_changes": output_changes,
+        "output_widened": any(change["kind"] == "enum_loosened" for change in output_changes),
         "schema_changes": schema_changes,
         "widened": any(change["widened"] for change in schema_changes),
     }
@@ -340,7 +388,7 @@ def compare_listings(pinned: dict[str, Any], current: list[dict[str, Any]]) -> d
     removed = sorted(set(locked) - set(by_name))
     changed, unchanged = [], []
     for name in sorted(set(by_name) & set(locked)):
-        if _digest(by_name[name]) == locked[name]["sha256"]:
+        if _digest_against_pin(by_name[name], locked[name]["definition"]) == locked[name]["sha256"]:
             unchanged.append(name)
         else:
             changed.append(diff_tool(locked[name]["definition"], by_name[name]))
@@ -381,6 +429,25 @@ def format_schema_change(change: dict[str, Any]) -> str:
     return f"    {flag}{text}"
 
 
+def format_output_change(change: dict[str, Any]) -> str:
+    """One output-schema finding, on a line of its own.
+
+    A new enum value is ``output widened``. Every other output edit, including
+    a removed enum value, is ``output changed``.
+    """
+    if change["kind"] == "enum_loosened":
+        return (
+            f"    output widened: {change['path']} ({change['detail']}); "
+            "a new output enum value can break downstream exhaustive switches"
+        )
+    if change["kind"] == "output_added":
+        return "    output changed: outputSchema added (not present in the pin)"
+    if change["kind"] == "output_removed":
+        return "    output changed: outputSchema removed"
+    text = format_schema_change({**change, "widened": False}).strip()
+    return f"    output changed: {text}"
+
+
 def _section(title: str, names: list[str], prefix: str) -> list[str]:
     lines = [f"{title} ({len(names)}):"]
     lines.extend(f"  {prefix} {name}" for name in names)
@@ -413,6 +480,9 @@ def format_text(report: dict[str, Any]) -> str:
         if item["schema_changes"]:
             lines.append("    schema:")
             lines.extend(format_schema_change(change) for change in item["schema_changes"])
+        if item["output_changes"]:
+            lines.append("    output schema:")
+            lines.extend(format_output_change(change) for change in item["output_changes"])
         if item["annotations_changed"]:
             lines.append("    annotations changed")
         if item["widened"]:
@@ -468,9 +538,9 @@ def cmd_check(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Pin MCP tool definitions from a local tools/list JSON file and "
-            "diff a later listing. Read-only: no network and no tool calls. "
-            "Authorized defensive use only."
+            "Pin MCP tool definitions, including outputSchema, from a local "
+            "tools/list JSON file and diff a later listing. Read-only: no "
+            "network and no tool calls. Authorized defensive use only."
         )
     )
     sub = parser.add_subparsers(dest="command", required=True)
