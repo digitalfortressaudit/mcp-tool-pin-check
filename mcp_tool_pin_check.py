@@ -11,7 +11,10 @@ Does not connect to a server, call tools, or execute listing text. Use only
 on servers you own or are authorized to assess.
 
 Each pinned tool includes ``outputSchema`` (``null`` when the listing has
-none). The SHA-256 is the canonical JSON of that whole definition.
+none). The SHA-256 is the canonical JSON of that whole definition. When the
+listing also includes an MCP initialize result, the lock records
+``serverInfo.name``, ``serverInfo.version``, and ``protocolVersion`` if it
+is present. Those identity fields are not part of the tool hash.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 EXIT_OK = 0
 EXIT_DRIFT = 1
@@ -148,10 +151,106 @@ def normalize_listing(payload: Any) -> list[dict[str, Any]]:
     return tools
 
 
-def build_lock(tools: list[dict[str, Any]], source: str, pinned_at: str) -> dict[str, Any]:
-    """Build a deterministic lock document. ``tools`` must already be sorted."""
+def _single_line(value: Any, label: str) -> str:
+    """Require a non-empty single-line string and keep it exactly as given."""
+    if not isinstance(value, str) or value.strip() == "" or value != value.strip():
+        raise InputError(f"{label} must be a non-empty string")
+    if any(ord(char) < 32 for char in value):
+        raise InputError(f"{label} must be a single-line string")
+    return value
+
+
+def _identity_from_result(obj: dict[str, Any]) -> dict[str, str] | None:
+    """Read ``serverInfo`` and optional ``protocolVersion`` from one object.
+
+    Returns ``None`` when the object carries neither field. A
+    ``protocolVersion`` without ``serverInfo`` is an input error.
+    """
+    has_info = "serverInfo" in obj
+    has_protocol = "protocolVersion" in obj
+    if not has_info and not has_protocol:
+        return None
+    if not has_info:
+        raise InputError("protocolVersion was set without serverInfo")
+    info = obj["serverInfo"]
+    if not isinstance(info, dict):
+        raise InputError("serverInfo must be a JSON object")
+    identity = {
+        "name": _single_line(info.get("name"), "serverInfo.name"),
+        "version": _single_line(info.get("version"), "serverInfo.version"),
+    }
+    if has_protocol:
+        identity["protocolVersion"] = _single_line(obj.get("protocolVersion"), "protocolVersion")
+    return identity
+
+
+def _unwrap_initialize(value: Any) -> dict[str, Any]:
+    """Accept a bare initialize result or a JSON-RPC envelope around one."""
+    if not isinstance(value, dict):
+        raise InputError("initialize must be a JSON object")
+    result = value.get("result")
+    if isinstance(result, dict) and ("serverInfo" in result or "protocolVersion" in result):
+        return result
+    return value
+
+
+def extract_identity(payload: Any) -> dict[str, str] | None:
+    """Return server identity included with a tools listing, or ``None``.
+
+    Accepted shapes, all optional:
+
+    - ``serverInfo`` and optional ``protocolVersion`` on the same object as
+      ``tools``, or inside ``result`` next to ``tools``
+    - an ``initialize`` object next to the tools: a bare initialize result,
+      or a JSON-RPC response whose ``result`` is that initialize result
+
+    A bare tool list has no identity. Two identity objects are allowed only
+    when they are the same name, version, and protocolVersion.
+    """
+    if not isinstance(payload, dict):
+        return None
+    found: list[dict[str, str]] = []
+    if "initialize" in payload:
+        identity = _identity_from_result(_unwrap_initialize(payload["initialize"]))
+        if identity is None:
+            raise InputError("initialize has no serverInfo")
+        found.append(identity)
+    direct = _identity_from_result(payload)
+    if direct is not None:
+        found.append(direct)
+    result = payload.get("result")
+    if isinstance(result, dict):
+        nested = _identity_from_result(result)
+        if nested is not None:
+            found.append(nested)
+    if not found:
+        return None
+    first = found[0]
+    for other in found[1:]:
+        if canonical(other) != canonical(first):
+            raise InputError("listing contains conflicting server identity")
+    return first
+
+
+def build_lock(
+    tools: list[dict[str, Any]],
+    source: str,
+    pinned_at: str,
+    server: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic lock document. ``tools`` must already be sorted.
+
+    ``server`` is omitted when the listing has no identity, so a tools-only
+    pin stays compatible with a v0.2.0 lock of the same tools.
+    """
     entries = [{"definition": item, "name": item["name"], "sha256": _digest(item)} for item in tools]
-    return {"lockfile_version": 1, "pinned_at": pinned_at, "source": source, "tools": entries}
+    lock: dict[str, Any] = {"lockfile_version": 1, "pinned_at": pinned_at, "source": source, "tools": entries}
+    if server is not None:
+        recorded = {"name": server["name"], "version": server["version"]}
+        if "protocolVersion" in server:
+            recorded["protocolVersion"] = server["protocolVersion"]
+        lock["server"] = recorded
+    return lock
 
 
 def write_lock(path: Path, lock: dict[str, Any]) -> None:
@@ -181,7 +280,28 @@ def parse_lock(payload: Any, path: Path) -> dict[str, Any]:
         if name in pinned:
             raise InputError(f"{path} lists tool {name!r} more than once")
         pinned[name] = item
-    return {"pinned_at": payload.get("pinned_at", ""), "source": payload.get("source", ""), "tools": pinned}
+    return {
+        "pinned_at": payload.get("pinned_at", ""),
+        "server": _parse_server(payload, path),
+        "source": payload.get("source", ""),
+        "tools": pinned,
+    }
+
+
+def _parse_server(payload: dict[str, Any], path: Path) -> dict[str, str] | None:
+    """Read optional server identity. A missing key means it was not pinned."""
+    if "server" not in payload:
+        return None
+    server = payload["server"]
+    if not isinstance(server, dict):
+        raise InputError(f"{path} server identity must be a JSON object")
+    parsed = {
+        "name": _single_line(server.get("name"), f"{path} server name"),
+        "version": _single_line(server.get("version"), f"{path} server version"),
+    }
+    if "protocolVersion" in server:
+        parsed["protocolVersion"] = _single_line(server.get("protocolVersion"), f"{path} protocolVersion")
+    return parsed
 
 
 def compare_schemas(old: Any, new: Any, path: str = "", depth: int = 0) -> list[dict[str, Any]]:
@@ -380,8 +500,37 @@ def diff_tool(old_def: dict[str, Any], new_def: dict[str, Any]) -> dict[str, Any
     }
 
 
-def compare_listings(pinned: dict[str, Any], current: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compare normalized tools with a parsed lockfile."""
+def compare_identity(pinned: dict[str, str] | None, current: dict[str, str] | None) -> dict[str, Any]:
+    """Compare pinned server identity with the listing's initialize result.
+
+    A missing pin means identity was not recorded. Version and protocol
+    differences are informational. A different server name is drift: the
+    listing may be from a different server than the one that was reviewed.
+    Identity added or removed is reported and is not, by itself, drift.
+    """
+    report: dict[str, Any] = {
+        "current": current,
+        "identity_added": pinned is None and current is not None,
+        "identity_removed": pinned is not None and current is None,
+        "name_changed": False,
+        "note": None if pinned is not None else "identity was not pinned",
+        "pinned": pinned,
+        "protocol_changed": False,
+        "version_changed": False,
+    }
+    if pinned is not None and current is not None:
+        report["name_changed"] = pinned["name"] != current["name"]
+        report["version_changed"] = pinned["version"] != current["version"]
+        report["protocol_changed"] = pinned.get("protocolVersion") != current.get("protocolVersion")
+    return report
+
+
+def compare_listings(
+    pinned: dict[str, Any],
+    current: list[dict[str, Any]],
+    current_identity: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Compare normalized tools and server identity with a parsed lockfile."""
     by_name = {item["name"]: item for item in current}
     locked = pinned["tools"]
     added = sorted(set(by_name) - set(locked))
@@ -392,13 +541,16 @@ def compare_listings(pinned: dict[str, Any], current: list[dict[str, Any]]) -> d
             unchanged.append(name)
         else:
             changed.append(diff_tool(locked[name]["definition"], by_name[name]))
+    identity = compare_identity(pinned.get("server"), current_identity)
+    tool_drift = bool(added or removed or changed)
     return {
         "added": added,
         "changed": changed,
         "lock_source": pinned.get("source", ""),
-        "ok": not added and not removed and not changed,
+        "ok": not tool_drift and not identity["name_changed"],
         "pinned_at": pinned.get("pinned_at", ""),
         "removed": removed,
+        "server": identity,
         "unchanged": unchanged,
     }
 
@@ -456,6 +608,46 @@ def _section(title: str, names: list[str], prefix: str) -> list[str]:
     return lines
 
 
+def _identity_label(identity: dict[str, str]) -> str:
+    label = f"{identity['name']} {identity['version']}"
+    protocol = identity.get("protocolVersion")
+    if protocol:
+        return f"{label} (protocol {protocol})"
+    return label
+
+
+def format_server_section(server: dict[str, Any]) -> list[str]:
+    """Identity findings. Version and protocol lines are informational."""
+    lines = ["server identity:"]
+    if server["note"]:
+        lines.append(f"  note: {server['note']}")
+    if server["identity_added"]:
+        lines.append("  identity added: " + _identity_label(server["current"]))
+    if server["identity_removed"]:
+        lines.append("  identity removed: " + _identity_label(server["pinned"]))
+    if server["name_changed"]:
+        lines.append(f"  server name changed: {server['pinned']['name']} -> {server['current']['name']}")
+    if server["version_changed"]:
+        lines.append(f"  server version changed: {server['pinned']['version']} -> {server['current']['version']}")
+    if server["protocol_changed"]:
+        before = server["pinned"].get("protocolVersion") or "(none)"
+        after = server["current"].get("protocolVersion") or "(none)"
+        lines.append(f"  protocol version changed: {before} -> {after}")
+    quiet = not any(
+        (
+            server["note"],
+            server["identity_added"],
+            server["identity_removed"],
+            server["name_changed"],
+            server["version_changed"],
+            server["protocol_changed"],
+        )
+    )
+    if quiet:
+        lines.append("  unchanged: " + _identity_label(server["pinned"]))
+    return lines
+
+
 def format_text(report: dict[str, Any]) -> str:
     """Render a check report for a terminal."""
     lines = [
@@ -465,6 +657,8 @@ def format_text(report: dict[str, Any]) -> str:
         "result: unchanged" if report["ok"] else "result: drift",
         "",
     ]
+    lines.extend(format_server_section(report["server"]))
+    lines.append("")
     lines.extend(_section("added", report["added"], "+"))
     lines.extend(_section("removed", report["removed"], "-"))
     lines.append(f"changed ({len(report['changed'])}):")
@@ -498,6 +692,8 @@ def format_pin(lock_path: Path, lock: dict[str, Any]) -> str:
         f"source: {lock['source']}",
         f"pinned_at: {lock['pinned_at']}",
     ]
+    if "server" in lock:
+        lines.append("server: " + _identity_label(lock["server"]))
     lines.extend(f"  {item['name']} {item['sha256']}" for item in lock["tools"])
     return "\n".join(lines) + "\n"
 
@@ -510,11 +706,16 @@ def _emit(payload: dict[str, Any], as_json: bool, text: str) -> None:
         sys.stdout.write(text)
 
 
+def _load_listing(path: Path) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
+    payload = load_json(path)
+    return normalize_listing(payload), extract_identity(payload)
+
+
 def cmd_pin(args: argparse.Namespace) -> int:
-    tools = normalize_listing(load_json(Path(args.listing)))
+    tools, server = _load_listing(Path(args.listing))
     source = _label(args.source, "--source") if args.source is not None else args.listing
     pinned_at = _label(args.pinned_at, "--pinned-at") if args.pinned_at else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lock = build_lock(tools, source, pinned_at)
+    lock = build_lock(tools, source, pinned_at, server)
     write_lock(Path(args.lock), lock)
     summary = {
         "lock": args.lock,
@@ -523,14 +724,16 @@ def cmd_pin(args: argparse.Namespace) -> int:
         "tool_count": len(lock["tools"]),
         "tools": [{"name": item["name"], "sha256": item["sha256"]} for item in lock["tools"]],
     }
+    if "server" in lock:
+        summary["server"] = lock["server"]
     _emit(summary, args.json, format_pin(Path(args.lock), lock))
     return EXIT_OK
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    current = normalize_listing(load_json(Path(args.listing)))
+    current, server = _load_listing(Path(args.listing))
     lock_path = Path(args.lock)
-    report = compare_listings(parse_lock(load_json(lock_path), lock_path), current)
+    report = compare_listings(parse_lock(load_json(lock_path), lock_path), current, server)
     _emit(report, args.json, format_text(report))
     return EXIT_OK if report["ok"] else EXIT_DRIFT
 
@@ -539,8 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Pin MCP tool definitions, including outputSchema, from a local "
-            "tools/list JSON file and diff a later listing. Read-only: no "
-            "network and no tool calls. Authorized defensive use only."
+            "tools/list JSON file and diff a later listing. When that JSON "
+            "also includes an MCP initialize result, pin stores "
+            "serverInfo.name, serverInfo.version, and protocolVersion if "
+            "present. Read-only: no network and no tool calls. Authorized "
+            "defensive use only."
         )
     )
     sub = parser.add_subparsers(dest="command", required=True)

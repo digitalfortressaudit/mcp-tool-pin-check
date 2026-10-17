@@ -484,6 +484,295 @@ class PinCheckTests(unittest.TestCase):
             self.assertIn("outputSchema", err)
             self.assertFalse((root / "bad.lock.json").exists())
 
+    def _pin_notes(self, listing: Path, lock: Path) -> tuple[int, str, str]:
+        return self._run(
+            [
+                "pin",
+                "--listing",
+                str(listing),
+                "--lock",
+                str(lock),
+                "--source",
+                "local-notes",
+                "--pinned-at",
+                PINNED_AT,
+            ]
+        )
+
+    def test_server_version_change_exits_0(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "tools.lock.json"
+            pin_code, pin_out, pin_err = self._pin_notes(EXAMPLES / "tools-list.identity.json", lock)
+            self.assertEqual((pin_code, pin_err), (0, ""))
+            self.assertIn("server: local-notes 1.0.0 (protocol 2025-06-18)", pin_out)
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.identity-version.json"), "--lock", str(lock)]
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("result: unchanged", out)
+            self.assertIn("server version changed: 1.0.0 -> 1.1.0", out)
+            self.assertNotIn("server name changed", out)
+            self.assertNotIn("protocol version changed", out)
+            json_code, json_out, json_err = self._run(
+                [
+                    "check",
+                    "--listing",
+                    str(EXAMPLES / "tools-list.identity-version.json"),
+                    "--lock",
+                    str(lock),
+                    "--json",
+                ]
+            )
+            self.assertEqual((json_code, json_err), (0, ""))
+            report = json.loads(json_out)
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["server"]["version_changed"])
+            self.assertFalse(report["server"]["name_changed"])
+
+            drifted = json.loads((EXAMPLES / "tools-list.identity-version.json").read_text(encoding="utf-8"))
+            drifted["result"]["tools"][0]["description"] = "Changed after the pin."
+            current = self._write(Path(tmp), "drift.json", drifted)
+            code, out, err = self._run(["check", "--listing", str(current), "--lock", str(lock)])
+            self.assertEqual((code, err), (1, ""))
+            self.assertIn("result: drift", out)
+            self.assertIn("server version changed: 1.0.0 -> 1.1.0", out)
+            self.assertIn("~ get_note", out)
+
+    def test_protocol_version_change_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock = root / "tools.lock.json"
+            pin_code, _, pin_err = self._pin_notes(EXAMPLES / "tools-list.identity.json", lock)
+            self.assertEqual((pin_code, pin_err), (0, ""))
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.identity-protocol.json"), "--lock", str(lock)]
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("result: unchanged", out)
+            self.assertIn("protocol version changed: 2025-06-18 -> 2024-11-05", out)
+            self.assertNotIn("server name changed", out)
+            self.assertNotIn("server version changed", out)
+            report = json.loads(
+                self._run(
+                    [
+                        "check",
+                        "--json",
+                        "--listing",
+                        str(EXAMPLES / "tools-list.identity-protocol.json"),
+                        "--lock",
+                        str(lock),
+                    ]
+                )[1]
+            )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["server"]["protocol_changed"])
+            self.assertFalse(report["server"]["version_changed"])
+
+            without = json.loads((EXAMPLES / "tools-list.identity.json").read_text(encoding="utf-8"))
+            del without["initialize"]["result"]["protocolVersion"]
+            bare = self._write(root, "no-protocol.json", without)
+            bare_lock = root / "bare.lock.json"
+            self.assertEqual(self._pin_notes(bare, bare_lock)[0], 0)
+            stored = json.loads(bare_lock.read_text(encoding="utf-8"))["server"]
+            self.assertEqual(stored, {"name": "local-notes", "version": "1.0.0"})
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.identity.json"), "--lock", str(bare_lock)]
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("protocol version changed: (none) -> 2025-06-18", out)
+
+    def test_server_name_change_is_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "tools.lock.json"
+            pin_code, _, pin_err = self._pin_notes(EXAMPLES / "tools-list.identity.json", lock)
+            self.assertEqual((pin_code, pin_err), (0, ""))
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.identity-name.json"), "--lock", str(lock)]
+            )
+            self.assertEqual((code, err), (1, ""))
+            self.assertIn("result: drift", out)
+            self.assertIn("server name changed: local-notes -> other-notes", out)
+            self.assertIn("unchanged (2): get_note, list_notes", out)
+            self.assertNotIn("server version changed", out)
+            self.assertNotIn("protocol version changed", out)
+            report = json.loads(
+                self._run(
+                    [
+                        "check",
+                        "--json",
+                        "--listing",
+                        str(EXAMPLES / "tools-list.identity-name.json"),
+                        "--lock",
+                        str(lock),
+                    ]
+                )[1]
+            )
+            self.assertFalse(report["ok"])
+            self.assertTrue(report["server"]["name_changed"])
+            self.assertEqual(report["added"], [])
+            self.assertEqual(report["removed"], [])
+            self.assertEqual(report["changed"], [])
+
+    def test_legacy_lock_without_identity_checks_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = json.loads((EXAMPLES / "tools-list.json").read_text(encoding="utf-8"))
+            v01_tools = []
+            for tool in payload["result"]["tools"]:
+                definition = {
+                    "annotations": tool["annotations"],
+                    "description": tool["description"],
+                    "inputSchema": tool["inputSchema"],
+                    "name": tool["name"],
+                }
+                v01_tools.append({"definition": definition, "name": tool["name"], "sha256": pin._digest(definition)})
+            v01_tools.sort(key=lambda item: item["name"])
+            v01 = {
+                "lockfile_version": 1,
+                "pinned_at": PINNED_AT,
+                "source": "local-notes",
+                "tools": v01_tools,
+            }
+            normalized = pin.normalize_listing(payload)
+            v020 = pin.build_lock(normalized, "local-notes", PINNED_AT)
+            self.assertNotIn("server", v01)
+            self.assertNotIn("server", v020)
+            self.assertTrue(all("outputSchema" not in item["definition"] for item in v01["tools"]))
+            self.assertTrue(all(item["definition"]["outputSchema"] is None for item in v020["tools"]))
+            locks = {
+                "v0.1": self._write(root, "v01.lock.json", v01),
+                "v0.2.0": self._write(root, "v020.lock.json", v020),
+            }
+            for name, lock in locks.items():
+                code, out, err = self._run(
+                    ["check", "--listing", str(EXAMPLES / "tools-list.json"), "--lock", str(lock)]
+                )
+                self.assertEqual((code, err), (0, ""), name)
+                self.assertIn("result: unchanged", out, name)
+                self.assertIn("note: identity was not pinned", out, name)
+                self.assertNotIn("identity added", out, name)
+                self.assertNotIn("server name changed", out, name)
+
+                code, out, err = self._run(
+                    ["check", "--listing", str(EXAMPLES / "tools-list.identity.json"), "--lock", str(lock)]
+                )
+                self.assertEqual((code, err), (0, ""), name)
+                self.assertIn("result: unchanged", out, name)
+                self.assertIn("note: identity was not pinned", out, name)
+                self.assertIn("identity added: local-notes 1.0.0 (protocol 2025-06-18)", out, name)
+                self.assertNotIn("server name changed", out, name)
+
+    def test_identity_round_trips_through_pin(self) -> None:
+        self.assertEqual(pin.__version__, "0.2.1")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.lock.json"
+            second = root / "b.lock.json"
+            plain = root / "plain.lock.json"
+            code_a, out_a, err_a = self._pin_notes(EXAMPLES / "tools-list.identity.json", first)
+            code_b, _, err_b = self._pin_notes(EXAMPLES / "tools-list.identity.json", second)
+            code_plain, _, err_plain = self._pin_notes(EXAMPLES / "tools-list.json", plain)
+            self.assertEqual((code_a, err_a, code_b, err_b, code_plain, err_plain), (0, "", 0, "", 0, ""))
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            locked = json.loads(first.read_text(encoding="utf-8"))
+            plain_lock = json.loads(plain.read_text(encoding="utf-8"))
+            self.assertEqual(
+                locked["server"],
+                {"name": "local-notes", "protocolVersion": "2025-06-18", "version": "1.0.0"},
+            )
+            self.assertNotIn("server", plain_lock)
+            self.assertEqual(
+                [item["sha256"] for item in locked["tools"]],
+                [item["sha256"] for item in plain_lock["tools"]],
+            )
+            self.assertIn("server: local-notes 1.0.0 (protocol 2025-06-18)", out_a)
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.identity.json"), "--lock", str(first)]
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("result: unchanged", out)
+            self.assertIn("unchanged: local-notes 1.0.0 (protocol 2025-06-18)", out)
+            self.assertNotIn("server name changed", out)
+            self.assertNotIn("server version changed", out)
+            self.assertNotIn("protocol version changed", out)
+            self.assertNotIn("identity added", out)
+            self.assertNotIn("identity removed", out)
+            self.assertNotIn("identity was not pinned", out)
+
+            listing = json.loads((EXAMPLES / "tools-list.json").read_text(encoding="utf-8"))
+            alongside = {
+                "protocolVersion": "2025-06-18",
+                "serverInfo": {"name": "local-notes", "version": "1.0.0"},
+                "tools": listing["result"]["tools"],
+            }
+            other = self._write(root, "alongside.json", alongside)
+            other_lock = root / "alongside.lock.json"
+            code, _, err = self._pin_notes(other, other_lock)
+            self.assertEqual((code, err), (0, ""))
+            stored = json.loads(other_lock.read_text(encoding="utf-8"))
+            self.assertEqual(stored["server"], locked["server"])
+            self.assertEqual(
+                [item["sha256"] for item in stored["tools"]],
+                [item["sha256"] for item in locked["tools"]],
+            )
+            code, out, err = self._run(["check", "--listing", str(other), "--lock", str(first)])
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("unchanged: local-notes 1.0.0 (protocol 2025-06-18)", out)
+
+    def test_identity_removed_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "tools.lock.json"
+            self.assertEqual(self._pin_notes(EXAMPLES / "tools-list.identity.json", lock)[0], 0)
+            code, out, err = self._run(
+                ["check", "--listing", str(EXAMPLES / "tools-list.json"), "--lock", str(lock)]
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("result: unchanged", out)
+            self.assertIn("identity removed: local-notes 1.0.0 (protocol 2025-06-18)", out)
+            self.assertNotIn("server name changed", out)
+            self.assertNotIn("identity was not pinned", out)
+
+    def test_bad_identity_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock = root / "tools.lock.json"
+            broken = self._write(
+                root,
+                "broken.json",
+                {"serverInfo": "notes", "tools": [{"name": "get_note", "inputSchema": {}}]},
+            )
+            code, _, err = self._run(["pin", "--listing", str(broken), "--lock", str(lock)])
+            self.assertEqual(code, 2)
+            self.assertIn("serverInfo", err)
+            self.assertFalse(lock.exists())
+
+            protocol_only = self._write(
+                root,
+                "protocol-only.json",
+                {"protocolVersion": "2025-06-18", "tools": [{"name": "get_note", "inputSchema": {}}]},
+            )
+            code, _, err = self._run(["pin", "--listing", str(protocol_only), "--lock", str(lock)])
+            self.assertEqual(code, 2)
+            self.assertIn("protocolVersion", err)
+            self.assertFalse(lock.exists())
+
+            conflict = json.loads((EXAMPLES / "tools-list.identity.json").read_text(encoding="utf-8"))
+            conflict["serverInfo"] = {"name": "other-notes", "version": "9.9.9"}
+            conflicted = self._write(root, "conflict.json", conflict)
+            code, _, err = self._run(["pin", "--listing", str(conflicted), "--lock", str(lock)])
+            self.assertEqual(code, 2)
+            self.assertIn("conflicting", err)
+            self.assertFalse(lock.exists())
+
+            good = self._write(root, "good.json", {"tools": [{"name": "get_note", "inputSchema": {}}]})
+            self.assertEqual(self._run(["pin", "--listing", str(good), "--lock", str(lock), "--pinned-at", PINNED_AT])[0], 0)
+            tampered = json.loads(lock.read_text(encoding="utf-8"))
+            tampered["server"] = "notes"
+            bad_lock = self._write(root, "bad.lock.json", tampered)
+            code, _, err = self._run(["check", "--listing", str(good), "--lock", str(bad_lock)])
+            self.assertEqual(code, 2)
+            self.assertIn("server identity", err)
+
 
 if __name__ == "__main__":
     unittest.main()
